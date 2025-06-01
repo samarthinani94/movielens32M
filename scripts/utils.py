@@ -1,0 +1,1 @@
+root_dir = "/Users/samarthinani/Git_projects/movielens32M/"
