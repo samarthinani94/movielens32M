@@ -204,5 +204,4 @@ cython_debug/
 *.parquet
 *.pickle
 *.pkl
-*.txt
 *.pth
