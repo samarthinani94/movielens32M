@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
 
 from scripts.utils import root_dir
-from scripts.modeling.models import MatrixFactorization, RatingDataset
+from scripts.modeling.mf_model import MatrixFactorization, RatingDataset
 
 # PARAMETERS
 train_data_path = os.path.join(root_dir, 'data', 'ml-32m', 'processed', 'train_20_core.csv')
@@ -92,7 +92,7 @@ print(f"Validation dataloader initialized with batch size {batch_size}.")
 #-------------- MODEL TRAINING SETUP --------------
 
 # model parameters
-embedding_dim = 10
+embedding_dim = 100
 model_file_name = f'mf_model_{embedding_dim}.pth'
 model_save_path = os.path.join(save_model_path, model_file_name)
 

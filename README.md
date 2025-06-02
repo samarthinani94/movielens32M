@@ -50,3 +50,5 @@ A movie recommender system based on MovieLens data.
 ### Metadata
 - Includes **movie release year**, which can be used as metadata.
 
+
+## matrix factorization + MSE - ndcg = 0.052

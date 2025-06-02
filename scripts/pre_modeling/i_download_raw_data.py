@@ -3,7 +3,7 @@ import numpy as np
 import os
 import requests
 import zipfile
-from utils import root_dir
+from scripts.utils import root_dir
 
 data_url = "https://files.grouplens.org/datasets/movielens/ml-32m.zip"
 download_path = "data/ml-32m.zip"
