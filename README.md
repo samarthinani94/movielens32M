@@ -52,3 +52,4 @@ A movie recommender system based on MovieLens data.
 
 
 ## matrix factorization + MSE - ndcg = 0.052
+## nmf 

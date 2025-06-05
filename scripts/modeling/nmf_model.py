@@ -25,6 +25,12 @@ class NeuralMF(nn.Module):
 
         # Final output projection
         self.output_layer = nn.Linear(hidden_layers[-1] + embedding_dim, 1)
+        
+        #initialize embeddings
+        nn.init.normal_(self.user_embedding_gmf.weight, std=0.01)
+        nn.init.normal_(self.item_embedding_gmf.weight, std=0.01)
+        nn.init.normal_(self.user_embedding_mlp.weight, std=0.01)
+        nn.init.normal_(self.item_embedding_mlp.weight, std=0.01)
 
     def forward(self, user_indices, pos_item_indices, neg_item_indices):
         # GMF embeddings
