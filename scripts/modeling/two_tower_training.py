@@ -314,3 +314,198 @@ for epoch in range(num_epochs):
 print("Training finished.")
 
 
+# STAGE 2: RE-RANKER NN MODEL TRAINING
+
+print("\n--- Starting Re-Ranker NN Model Preparation & Training ---")
+
+# 1. Load the best trained Two-Tower model (Retriever)
+# -------------------------------------------------------------------
+print("Loading trained Two-Tower (Retriever) model...")
+# Instantiate a new model with the same architecture as the trained one
+retriever_model = TwoTowerSystem( # Use the same parameters as when you trained it
+    num_users=num_users_val, num_movies=num_movies_val, num_genres=num_genres_val,
+    num_years=num_years_val, num_movie_tags_vocab=num_movie_tags_vocab_val,
+    genre_list_len=GENRE_LIST_FIXED_LEN, tag_list_len=TAG_LIST_FIXED_LEN,
+    embedding_dim=embedding_dim_val, year_embedding_dim=year_embedding_dim_val,
+    hidden_dim_lstm=hidden_dim_lstm_val, hidden_dim_mlp_user=hidden_dim_mlp_user_val,
+    hidden_dim_mlp_movie=hidden_dim_mlp_movie_val
+)
+retriever_model.load_state_dict(torch.load(model_save_path, map_location=device))
+retriever_model.to(device)
+retriever_model.eval()
+print(f"Retriever model loaded from {model_save_path}")
+
+frozen_retriever_movie_embedding_layer = retriever_model.shared_movie_embedding_layer
+frozen_retriever_movie_embedding_layer.weight.requires_grad = False
+
+K_candidates = 500
+
+unique_user_history_df = train_data.copy()[['user_idx', 'last_5_items_idx']]
+unique_user_history_df['last_5_items_idx'] = unique_user_history_df['last_5_items_idx'].apply(lambda x: tuple(x))
+unique_user_history_df = unique_user_history_df.drop_duplicates().reset_index(drop=True)
+unique_user_history_df['last_5_items_idx'] = unique_user_history_df['last_5_items_idx'].apply(lambda x: list(x))
+
+# Pre-compute all item embeddings for fast scoring
+all_items_retriever_embeddings = frozen_retriever_movie_embedding_layer.weight.detach()[:num_movies_val]
+
+
+# Generate candidates in batches for efficiency
+def sample_negatives_from_candidates(candidates, pos_interactions, num_samples=5):
+    candidates = set(candidates) - pos_interactions
+    if len(candidates) <= num_samples:
+        return list(candidates)
+    return np.random.choice(np.array(list(candidates)), size=num_samples, replace=False).tolist()
+
+candidate_results = []
+cand_gen_batch_size = 512
+for i in tqdm(range(0, len(unique_user_history_df), cand_gen_batch_size), desc="Generating candidates"):
+    batch_df = unique_user_history_df.iloc[i:i+cand_gen_batch_size]
+    user_ids_tensor = torch.tensor(batch_df['user_idx'].values, dtype=torch.long).to(device)
+    history_tensor = torch.tensor(np.stack(batch_df['last_5_items_idx'].values), dtype=torch.long).to(device)
+
+    user_input_for_retriever = {
+        'user_id': user_ids_tensor,
+        'movie_history_ids': history_tensor
+    }
+
+    with torch.no_grad():
+        user_embeddings = retriever_model.user_tower(**user_input_for_retriever)
+
+    scores = torch.matmul(user_embeddings, all_items_retriever_embeddings.T)
+    _, top_k_indices = torch.topk(scores, K_candidates)
+
+    # For each user in the batch, sample negatives from candidates
+    for idx, row in batch_df.iterrows():
+        user_idx = row['user_idx']
+        pos_interactions = set(uidx2posidxs[user_idx])
+        candidates = top_k_indices[idx - batch_df.index[0]].cpu().tolist()
+        sampled_negatives = sample_negatives_from_candidates(candidates, pos_interactions, num_samples=5)
+        candidate_results.append({
+            'user_idx': user_idx,
+            'last_5_items_idx': row['last_5_items_idx'],
+            'sampled_negatives': sampled_negatives
+        })
+
+candidates_df = pd.DataFrame(candidate_results).explode('sampled_negatives').reset_index(drop=True)
+candidates_df.rename(columns={'sampled_negatives': 'neg_item_idx'}, inplace=True)
+
+# add pos_item_idx using train_data
+temp_df = train_data[['user_idx', 'last_5_items_idx', 'pos_item_idx']].copy()
+temp_df['last_5_items_idx'] = temp_df['last_5_items_idx'].apply(lambda x: tuple(x))
+temp_df = temp_df.drop_duplicates().reset_index(drop=True)
+
+candidates_df['last_5_items_idx'] = candidates_df['last_5_items_idx'].apply(lambda x: tuple(x))
+candidates_df = candidates_df.merge(temp_df[['user_idx', 'pos_item_idx', 'last_5_items_idx']],
+                                    on=['user_idx', 'last_5_items_idx'], how='inner')
+
+candidates_df = candidates_df.merge(movies_df, left_on='pos_item_idx', right_on='item_idx', how='inner')
+candidates_df.drop(columns=['item_idx'], inplace=True)
+candidates_df.rename(columns={
+    'genres_idx': 'ranker_pos_item_genres_idx',
+    'year_idx': 'ranker_pos_item_year_idx',
+    'tags_idx': 'ranker_pos_item_tags_idx'
+}, inplace=True)
+
+candidates_df = candidates_df.merge(movies_df, left_on='neg_item_idx', right_on='item_idx', how='inner')
+candidates_df.drop(columns=['item_idx'], inplace=True)
+candidates_df.rename(columns={
+    'genres_idx': 'ranker_neg_item_genres_idx',
+    'year_idx': 'ranker_neg_item_year_idx',
+    'tags_idx': 'ranker_neg_item_tags_idx'
+}, inplace=True)
+
+candidates_df.rename(columns={'pos_item_idx': 'ranker_pos_item_idx',
+                                 'neg_item_idx': 'ranker_neg_item_idx'}, inplace=True)
+
+candidates_df['last_5_items_idx'] = candidates_df['last_5_items_idx'].apply(lambda x: [int(i) for i in x])
+
+final_columns = [
+    'user_idx', 'last_5_items_idx', 'ranker_pos_item_idx', 'ranker_pos_item_genres_idx',
+    'ranker_pos_item_year_idx', 'ranker_pos_item_tags_idx', 'ranker_neg_item_idx',
+    'ranker_neg_item_genres_idx', 'ranker_neg_item_year_idx', 'ranker_neg_item_tags_idx'
+]
+
+# check if all columns are present
+for col in final_columns:
+    if col not in candidates_df.columns:
+        raise ValueError(f"Missing column in candidates_df: {col}")
+    
+candidates_df = candidates_df[final_columns].reset_index(drop=True)
+
+# save candidates_df as pickle
+candidates_df_path = os.path.join(model_save_dir, 'ranker_train_data.pkl')
+with open(candidates_df_path, 'wb') as f:
+    pickle.dump(candidates_df, f)
+
+# save validation data as pickle
+val_df_path = os.path.join(model_save_dir, 'ranker_val_data.pkl')
+with open(val_df_path, 'wb') as f:
+    pickle.dump(val_df, f)
+    
+# save two tower train_data as pickle
+two_tower_train_data_path = os.path.join(model_save_dir, 'two_tower_train_data.pkl')
+with open(two_tower_train_data_path, 'wb') as f:
+    pickle.dump(train_data, f)
+    
+# save twotower uidx2posidxs as pickle
+twotower_uidx2posidxs_path = os.path.join(model_save_dir, 'twotower_uidx2posidxs.pkl')
+with open(twotower_uidx2posidxs_path, 'wb') as f:
+    pickle.dump(uidx2posidxs, f)
+    
+# save twotower uidx2idxs as pickle
+twotower_uidx2idxs_path = os.path.join(model_save_dir, 'twotower_uidx2idxs.pkl')
+with open(twotower_uidx2idxs_path, 'wb') as f:
+    pickle.dump(uidx2idxs, f)
+    
+# save iid2idx as pickle
+iid2idx_path = os.path.join(model_save_dir, 'iid2idx.pkl')
+with open(iid2idx_path, 'wb') as f:
+    pickle.dump(iid2idx, f)
+    
+    
+# save two tower config as pickle
+two_tower_config = {
+    'num_users': num_users_val,
+    'num_movies': num_movies_val,
+    'num_genres': num_genres_val,
+    'num_years': num_years_val,
+    'num_movie_tags_vocab': num_movie_tags_vocab_val,
+    'genre_list_len': GENRE_LIST_FIXED_LEN,
+    'tag_list_len': TAG_LIST_FIXED_LEN,
+    'embedding_dim': embedding_dim_val,
+    'year_embedding_dim': year_embedding_dim_val,
+    'hidden_dim_lstm': hidden_dim_lstm_val,
+    'hidden_dim_mlp_user': hidden_dim_mlp_user_val,
+    'hidden_dim_mlp_movie': hidden_dim_mlp_movie_val
+}
+two_tower_config_path = os.path.join(model_save_dir, 'two_tower_config.pkl')
+with open(two_tower_config_path, 'wb') as f:
+    pickle.dump(two_tower_config, f)
+    
+
+# save two tower dataset parameters as pickle
+two_tower_dataset_params = {
+    'movie_history_len': movie_history_max_len,
+    'genre_list_len': GENRE_LIST_FIXED_LEN,
+    'tag_list_len': TAG_LIST_FIXED_LEN,
+    'movie_padding_idx': padding_idx_val_for_movies
+}
+two_tower_dataset_params_path = os.path.join(model_save_dir, 'two_tower_dataset_params.pkl')
+with open(two_tower_dataset_params_path, 'wb') as f:
+    pickle.dump(two_tower_dataset_params, f)
+    
+# save tag_dict, genre_dict, year_dict as pickle
+tag_dict_path = os.path.join(model_save_dir, 'tag_dict.pkl')
+with open(tag_dict_path, 'wb') as f:
+    pickle.dump(tag_dict, f)
+genre_dict_path = os.path.join(model_save_dir, 'genre_dict.pkl')
+with open(genre_dict_path, 'wb') as f:
+    pickle.dump(genre_dict, f)
+year_dict_path = os.path.join(model_save_dir, 'year_dict.pkl')
+with open(year_dict_path, 'wb') as f:
+    pickle.dump(year_dict, f)
+    
+# save movies_df as pickle
+movies_df_path = os.path.join(model_save_dir, 'movies_df.pkl')
+with open(movies_df_path, 'wb') as f:
+    pickle.dump(movies_df, f)
