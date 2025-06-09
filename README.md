@@ -51,8 +51,8 @@ movielens32m/
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repo-url>
-    cd movielens32m
+    git clone https://github.com/samarthinani94/movielens32M.git
+    cd movielens32M
     ```
 
 2.  **Create `utils.py`:**
@@ -112,7 +112,7 @@ A more powerful model combining Matrix Factorization with an MLP to capture more
 With the baselines validating the pipeline, the final, more sophisticated architecture was implemented.
 
 #### a. Stage 1: Two-Tower Retriever
-This model learns separate embeddings for users and movies, allowing for efficient retrieval of a candidate set from the entire movie corpus.
+This model learns separate embeddings for users and movies, allowing for efficient retrieval of a candidate set from the entire movie corpus. A fast and efficient Two-Tower Model scans a massive corpus of over 20,000 movies to generate a smaller, relevant candidate set (e.g., 500 items) for each user. This model is designed for high recall.
 * **Scripts**: `two_tower_retriever_model.py`, `two_tower_retriever_training.py`
 * **Function**: This script preprocesses all metadata (genres, years, tags), engineers user history features, trains the two-tower model, and evaluates its recall.
 * **Retriever Performance**:
@@ -141,4 +141,6 @@ The end-to-end system was evaluated by first retrieving 500 candidates for each 
 
 -   **Final nDCG@10**: **0.5466**
 
-This project successfully demonstrates the power of a modern two-stage recommender system. By decoupling the recommendation process into a high-recall retriever and a high-precision re-ranker, the system achieves a state-of-the-art result. The iterative debugging process, starting with simple, validated baselines, was critical to the final model's success.
+This project successfully demonstrates the power of a modern two-stage recommender system. By decoupling the recommendation process into a high-recall retriever and a high-precision re-ranker, the system achieves a state-of-the-art nDCG@10 of 0.5466 on a 20-core dense, high-quality subset of the MovieLens dataset. The iterative debugging process, starting with simple, validated baselines, was critical to the final model's success.
+
+Note: the nNCG@10 is higher than industry benchmarks because during preprocessing the data was reduced to 20 core making it dense.
