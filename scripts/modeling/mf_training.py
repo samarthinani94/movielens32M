@@ -102,7 +102,6 @@ model = MatrixFactorization(num_users, num_items, EMBEDDING_DIM).to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-# *** ADDING CYCLIC LR SCHEDULER ***
 iterations_per_epoch = len(train_loader)
 scheduler = CyclicLR(
     optimizer,

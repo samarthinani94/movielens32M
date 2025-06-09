@@ -43,7 +43,6 @@ def ndcg_at_k(popular_pool, val_df, train_seen_dict, k=10):
         # Get items this user has seen in training
         seen_items = train_seen_dict.get(user, set())
         
-        # *** THE CRUCIAL FIX ***
         # Filter the popular pool to get top K *new* items for this user
         user_recommendations = [item for item in popular_pool if item not in seen_items][:k]
         
