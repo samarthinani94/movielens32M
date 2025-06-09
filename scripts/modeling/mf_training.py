@@ -4,193 +4,192 @@ import time
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import root_mean_squared_error
+import sys
+sys.path.append("../../")
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CyclicLR
 
 from scripts.utils import root_dir
 from scripts.modeling.mf_model import MatrixFactorization, RatingDataset
 
-# PARAMETERS
-train_data_path = os.path.join(root_dir, 'data', 'ml-32m', 'processed', 'train_20_core.csv')
-validation_data_path = os.path.join(root_dir, 'data', 'ml-32m', 'processed', 'val_10_core.csv')
-save_model_path = os.path.join(root_dir, 'models', 'mf_model_files')
+# --- 1. PARAMETERS ---
+MODEL_ARTIFACTS_DIR = os.path.join(root_dir, 'models', 'mf_model_files')
+EMBEDDING_DIM = 100
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 1e-5
+EPOCHS = 20
+BATCH_SIZE = 4096
+NUM_NEG_SAMPLES = 4 # Number of negative samples per positive interaction
+K_NDCG = 10
+
+# Check for GPU
 if torch.backends.mps.is_available():
     device = torch.device("mps")
     print("MPS device found. Using GPU.")
 elif torch.cuda.is_available():
-    device = torch.device("cuda") # Fallback for NVIDIA GPUs if needed
+    device = torch.device("cuda")
     print("CUDA device found. Using GPU.")
 else:
     device = torch.device("cpu")
     print("No GPU backend found. Using CPU.")
 
-# -----------  MODEL DATA SETUP -----------
-# Load the training data
-train_df = pd.read_csv(train_data_path)
-train_df = train_df[['userId', 'movieId', 'rating']]
-print(f"Training data loaded with {len(train_df)} records.")
+# --- 2. DATA SETUP ---
+print("Loading and preparing data...")
+train_data_path = os.path.join(root_dir, 'data', 'ml-32m', 'processed', 'train_20_core.csv')
+validation_data_path = os.path.join(root_dir, 'data', 'ml-32m', 'processed', 'val_10_core.csv')
 
-# load uid2idx and iid2idx if they exist
-if os.path.exists(os.path.join(save_model_path, 'uid2idx.pkl')) and os.path.exists(os.path.join(save_model_path, 'iid2idx.pkl')):
-    with open(os.path.join(save_model_path, 'uid2idx.pkl'), 'rb') as f:
-        uid2idx = pickle.load(f)
-    with open(os.path.join(save_model_path, 'iid2idx.pkl'), 'rb') as f:
-        iid2idx = pickle.load(f)
-    print("Loaded existing uid2idx and iid2idx mappings.")
-else:
-    # If not, create them from the training data
-    uid2idx = {user_id: idx for idx, user_id in enumerate(train_df['userId'].unique())}
-    iid2idx = {item_id: idx for idx, item_id in enumerate(train_df['movieId'].unique())}
-    # save the mappings in save_model_path
-    os.makedirs(save_model_path, exist_ok=True)
+train_df_orig = pd.read_csv(train_data_path)
+val_df = pd.read_csv(validation_data_path)
 
-    with open(os.path.join(save_model_path, 'uid2idx.pkl'), 'wb') as f:
-        pickle.dump(uid2idx, f)
+# Filter for items with at least one 4+ rating
+train_items = set(train_df_orig[train_df_orig['rating'] >= 4.0].movieId.unique())
+train_users = set(train_df_orig[train_df_orig['rating'] >= 4.0].userId.unique())
+train_df = train_df_orig[train_df_orig['movieId'].isin(train_items) & train_df_orig['userId'].isin(train_users)].copy()
 
-    with open(os.path.join(save_model_path, 'iid2idx.pkl'), 'wb') as f:
-        pickle.dump(iid2idx, f)
-    print("Created new uid2idx and iid2idx mappings and saved them.")
+# Create mappings from the filtered training data
+uid2idx = {user_id: idx for idx, user_id in enumerate(train_df['userId'].unique())}
+iid2idx = {item_id: idx for idx, item_id in enumerate(train_df['movieId'].unique())}
+num_users = len(uid2idx)
+num_items = len(iid2idx)
+all_item_indices = set(range(num_items))
 
-batch_size = 1024
-# Convert userId and movieId to indices
+# Map IDs to indices
 train_df['user_idx'] = train_df['userId'].map(uid2idx)
 train_df['item_idx'] = train_df['movieId'].map(iid2idx)
 
-# Create the dataset and dataloader
+# --- 3. IMPLICIT DATA PREPARATION (KEY CHANGE) ---
+print("Creating implicit training data with negative sampling...")
+# Get all positive interactions
+positive_interactions = train_df[['user_idx', 'item_idx']].copy()
+positive_interactions['rating'] = 1.0
+
+# Group interactions to find negatives for each user
+user_item_sets = train_df.groupby('user_idx')['item_idx'].apply(set)
+
+negative_samples = []
+for user_idx, seen_items in tqdm(user_item_sets.items(), desc="Negative Sampling"):
+    possible_negs = all_item_indices - seen_items
+    if not possible_negs:
+        continue
+    
+    num_samples = min(len(possible_negs), len(seen_items) * NUM_NEG_SAMPLES)
+    sampled_negs = np.random.choice(list(possible_negs), size=num_samples, replace=False)
+    
+    for neg_item_idx in sampled_negs:
+        negative_samples.append({'user_idx': user_idx, 'item_idx': neg_item_idx, 'rating': 0.0})
+
+negative_df = pd.DataFrame(negative_samples)
+train_data_implicit = pd.concat([positive_interactions, negative_df], ignore_index=True)
+
+# Create Dataset and DataLoader
 train_ds = RatingDataset(
-    user_indices=train_df['user_idx'].values,
-    item_indices=train_df['item_idx'].values,
-    ratings=train_df['rating'].values
+    user_indices=train_data_implicit['user_idx'].values,
+    item_indices=train_data_implicit['item_idx'].values,
+    ratings=train_data_implicit['rating'].values
 )
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+print(f"Implicit training dataset created with {len(train_ds)} records.")
 
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+# --- 4. MODEL TRAINING ---
+save_model_path = os.path.join(MODEL_ARTIFACTS_DIR, f'mf_implicit_model_{EMBEDDING_DIM}.pth')
+model = MatrixFactorization(num_users, num_items, EMBEDDING_DIM).to(device)
 
-print(f"Training dataset created with {len(train_ds)} records.")
-print(f"Train dataloader initialized with batch size {batch_size}.")
+# Use BCEWithLogitsLoss for implicit feedback
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-# validation data
-val_df = pd.read_csv(validation_data_path)
-val_df = val_df[['userId', 'movieId', 'rating']]
+# *** ADDING CYCLIC LR SCHEDULER ***
+iterations_per_epoch = len(train_loader)
+scheduler = CyclicLR(
+    optimizer,
+    base_lr=1e-5,
+    max_lr=1e-3,
+    step_size_up=4 * iterations_per_epoch, # 4 epochs to go from base to max
+    mode='triangular',
+    cycle_momentum=False
+)
+print("Added CyclicLR scheduler.")
+
+print("\nStarting model training...")
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    for user_indices, item_indices, ratings in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+        user_indices, item_indices, ratings = user_indices.to(device), item_indices.to(device), ratings.float().to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(user_indices, item_indices)
+        loss = criterion(outputs, ratings)
+        loss.backward()
+        optimizer.step()
+        
+        # Step the scheduler after each batch
+        scheduler.step()
+        
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    current_lr = scheduler.get_last_lr()[0]
+    print(f"Epoch {epoch+1}/{EPOCHS}, Average Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
+    
+    torch.save(model.state_dict(), save_model_path)
+    print(f"Model saved to {save_model_path}")
+
+# --- 5. EVALUATION ---
+print("\nRunning MF model evaluation...")
+model.eval()
+
+# Prepare validation and training seen data
 val_df['user_idx'] = val_df['userId'].map(uid2idx)
 val_df['item_idx'] = val_df['movieId'].map(iid2idx)
+val_df.dropna(subset=['user_idx', 'item_idx'], inplace=True)
+val_df['user_idx'] = val_df['user_idx'].astype(int)
+val_df['item_idx'] = val_df['item_idx'].astype(int)
 
-val_ds = RatingDataset(
-    user_indices=val_df['user_idx'].values,
-    item_indices=val_df['item_idx'].values,
-    ratings=val_df['rating'].values
-)
-val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+train_seen_dict = train_df.groupby('user_idx')['item_idx'].apply(set).to_dict()
 
-print(f"Validation dataset created with {len(val_ds)} records.")
-print(f"Validation dataloader initialized with batch size {batch_size}.")
+def ndcg_at_k(model, val_df, train_seen_dict, k=10):
+    distinct_users = val_df['user_idx'].unique()
+    ndcg_scores = []
+    
+    all_items_tensor = torch.tensor(list(range(num_items)), device=device)
 
-#-------------- MODEL TRAINING SETUP --------------
-
-# model parameters
-embedding_dim = 100
-model_file_name = f'mf_model_{embedding_dim}.pth'
-model_save_path = os.path.join(save_model_path, model_file_name)
-
-num_users = len(uid2idx)
-num_items = len(iid2idx)
-
-# load model if it exists
-if os.path.exists(model_save_path):
-    model = MatrixFactorization(num_users, num_items, embedding_dim)
-    model.load_state_dict(torch.load(model_save_path))
-    model.to(device)
-    print(f"Loaded existing model from {model_save_path}")
-else:
-    model = MatrixFactorization(num_users, num_items, embedding_dim)
-    model.to(device)
-    print("Initialized new model.")
-
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-
-iterations_per_epoch = len(train_loader)
-step_size_val = 4 * iterations_per_epoch
-
-scheduler = CyclicLR(
-    optimizer, 
-    base_lr=1e-4,      # Minimum LR
-    max_lr=5e-3,       # Peak LR
-    step_size_up=step_size_val,  # Number of training steps to increase LR
-    mode='triangular',  
-    cycle_momentum=False 
-)
-
-
-#-------------- MODEL TRAINING --------------
-
-def train_model(model, model_save_path, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, patience=3):
-    best_val_loss = float('inf')
-    counter = 0
-
-    for epoch in tqdm(range(num_epochs)):
-        start_time = time.time()
-        model.train()
-        train_preds, train_targets = [], []
-        train_loss = 0
-
-        for user_indices, item_indices, ratings in train_loader:
-            user_indices = user_indices.to(device)
-            item_indices = item_indices.to(device)
-            ratings = ratings.float().to(device)
-
-            optimizer.zero_grad()
-            outputs = model(user_indices, item_indices)
-            loss = criterion(outputs, ratings)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            train_loss += loss.item()
-            train_preds.extend(outputs.detach().cpu().numpy())
-            train_targets.extend(ratings.cpu().numpy())
-
-        train_rmse = root_mean_squared_error(train_targets, train_preds)
-
-        # Validation phase
-        model.eval()
-        val_preds, val_targets = [], []
-        val_loss = 0
-
+    for user in tqdm(distinct_users, desc=f"Calculating nDCG@{k}"):
+        user_tensor = torch.tensor([user] * num_items, device=device)
+        
         with torch.no_grad():
-            for user_indices, item_indices, ratings in val_loader:
-                user_indices = user_indices.to(device)
-                item_indices = item_indices.to(device)
-                ratings = ratings.float().to(device)
+            scores = model(user_tensor, all_items_tensor).cpu().numpy()
+        
+        item_score_df = pd.DataFrame({'item_idx': list(range(num_items)), 'score': scores})
+        
+        seen_items = train_seen_dict.get(user, set())
+        item_score_df = item_score_df[~item_score_df['item_idx'].isin(seen_items)]
+        
+        user_recommendations = item_score_df.sort_values('score', ascending=False).head(k)
+        
+        user_truth = val_df[val_df['user_idx'] == user]
+        if user_truth.empty: continue
+        
+        item_rel_dict = user_truth.set_index('item_idx')['rating'].to_dict()
+        
+        # Calculate DCG
+        user_recommendations['relevance'] = user_recommendations['item_idx'].map(item_rel_dict).fillna(0)
+        dcg = (user_recommendations['relevance'] / np.log2(np.arange(2, len(user_recommendations) + 2))).sum()
+        
+        # Calculate IDCG
+        ideal_relevances = user_truth['rating'].sort_values(ascending=False).head(k)
+        idcg = (ideal_relevances.values / np.log2(np.arange(2, len(ideal_relevances) + 2))).sum()
+        
+        ndcg = dcg / idcg if idcg > 0 else 0
+        ndcg_scores.append(ndcg)
+    
+    return np.mean(ndcg_scores)
 
-                outputs = model(user_indices, item_indices)
-                loss = criterion(outputs, ratings)
-                val_loss += loss.item()
-
-                val_preds.extend(outputs.cpu().numpy())
-                val_targets.extend(ratings.cpu().numpy())
-
-        val_rmse = root_mean_squared_error(val_targets, val_preds)
-        current_lr = scheduler.get_last_lr()[0]
-        end_time = time.time()
-        print(f"Epoch {epoch+1}/{num_epochs} - LR: {current_lr:.6f} - Train RMSE: {train_rmse:.4f} - Val RMSE: {val_rmse:.4f} - Time: {end_time - start_time:.2f}s")
-
-        # Early Stopping Check
-        if val_rmse < best_val_loss:
-            best_val_loss = val_rmse
-            counter = 0
-            torch.save(model.state_dict(), model_save_path)
-        else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping triggered at epoch {epoch+1}")
-                break
-
-    return model
-
-print("Starting model training...")
-train_model(model, model_save_path, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, patience=3)
+ndcg_score = ndcg_at_k(model, val_df, train_seen_dict, k=K_NDCG)
+print("\n" + "="*40)
+print(f"Implicit MF Model nDCG@{K_NDCG}: {ndcg_score:.4f}")
+print("="*40)
